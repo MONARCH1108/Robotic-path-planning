@@ -1,517 +1,691 @@
 import numpy as np
-import random
-import pickle
 import matplotlib.pyplot as plt
+import random
 from collections import defaultdict, deque
-import time
-from typing import Dict, List, Tuple, Optional
+import pickle
 import json
+from typing import Dict, List, Tuple, Optional
+import time
 
-# Import the environment (assuming the environment file is saved as 'multi_robot_environment.py')
-from Environment.environment import MultiRobotEnvironment
+# Import from your environment (assuming it's in the same directory)
+from Environment.multi_robot_env import MultiRobotEnvironment
 
-class MultiRobotQLearning:
+class QLearningAgent:
     """
-    Multi-Agent Q-Learning for Multi-Robot Path Planning and Task Allocation
-    
-    Each robot maintains its own Q-table and learns independently while
-    considering the dynamic environment and other robots' positions.
+    Q-Learning agent for multi-robot path planning with coordination mechanisms
     """
     
-    def __init__(self, env: MultiRobotEnvironment, 
-                 learning_rate=0.1, 
-                 discount_factor=0.95,
-                 epsilon_start=1.0,
-                 epsilon_end=0.01,
-                 epsilon_decay=0.995):
+    def __init__(self, 
+                 robot_id: int,
+                 grid_size: Tuple[int, int],
+                 learning_rate: float = 0.1,
+                 discount_factor: float = 0.95,
+                 epsilon: float = 1.0,
+                 epsilon_decay: float = 0.995,
+                 epsilon_min: float = 0.01):
         """
-        Initialize Q-Learning agents for multi-robot system
+        Initialize Q-Learning agent
         
         Args:
-            env: MultiRobotEnvironment instance
+            robot_id: Unique identifier for this robot
+            grid_size: Size of the environment grid
             learning_rate: Learning rate (alpha)
             discount_factor: Discount factor (gamma)
-            epsilon_start: Initial exploration rate
-            epsilon_end: Minimum exploration rate
-            epsilon_decay: Epsilon decay rate per episode
+            epsilon: Initial exploration rate
+            epsilon_decay: Rate of epsilon decay
+            epsilon_min: Minimum epsilon value
         """
-        self.env = env
+        self.robot_id = robot_id
+        self.grid_size = grid_size
         self.learning_rate = learning_rate
         self.discount_factor = discount_factor
-        self.epsilon_start = epsilon_start
-        self.epsilon_end = epsilon_end
+        self.epsilon = epsilon
         self.epsilon_decay = epsilon_decay
-        self.epsilon = epsilon_start
+        self.epsilon_min = epsilon_min
         
-        # Number of actions (0=stay, 1=up, 2=right, 3=down, 4=left)
+        # Q-table: state -> action -> Q-value
+        self.q_table = defaultdict(lambda: defaultdict(float))
+        
+        # Action space: 0=stay, 1=up, 2=right, 3=down, 4=left
         self.num_actions = 5
+        self.actions = list(range(self.num_actions))
         
-        # Q-tables for each robot (separate learning)
-        self.q_tables = {}
-        for robot_id in range(env.num_robots):
-            self.q_tables[robot_id] = defaultdict(lambda: np.zeros(self.num_actions))
+        # Learning statistics
+        self.training_episodes = 0
+        self.cumulative_reward = 0
+        self.episode_rewards = []
+        self.collision_count = 0
         
-        # Training statistics
-        self.training_stats = {
-            'episode_rewards': [],
-            'episode_lengths': [],
-            'task_completion_rates': [],
-            'collision_counts': [],
-            'epsilon_values': [],
-            'q_table_sizes': []
-        }
+        # Coordination memory
+        self.other_robots_memory = {}
+        self.coordination_weight = 0.2
         
-        print(f"Q-Learning initialized for {env.num_robots} robots")
-        print(f"Learning rate: {learning_rate}")
-        print(f"Discount factor: {discount_factor}")
-        print(f"Epsilon: {epsilon_start} -> {epsilon_end} (decay: {epsilon_decay})")
-    
-    def get_state_representation(self, robot_id: int, state: dict) -> tuple:
+    def get_state_key(self, observation: Dict) -> str:
         """
-        Convert environment state to a hashable state representation for Q-learning
+        Convert observation to a hashable state key for Q-table
         
-        This creates a compact state representation focusing on:
-        - Robot's position
-        - Assigned task information
-        - Local environment (nearby obstacles and robots)
-        - Task completion status
+        The state includes:
+        - Robot's current position
+        - Task information (target position, whether carrying)
+        - Local obstacles and other robots
+        - Distance to target
         """
-        robot = state['robots'][robot_id]
-        robot_pos = robot['position']
+        if observation is None:
+            return "terminal"
         
-        # Basic position info
-        pos_x, pos_y = robot_pos
+        pos = observation['position']
         
         # Task information
-        assigned_task = robot['assigned_task']
-        carrying_task = robot['carrying_task']
-        
-        # Target position (pickup or dropoff)
-        target_pos = (-1, -1)  # Default when no task
-        if assigned_task is not None:
-            task = state['tasks'][assigned_task]
-            target_pos = task['pickup'] if carrying_task is None else task['dropoff']
-        elif carrying_task is not None:
-            task = state['tasks'][carrying_task]
-            target_pos = task['dropoff']
-        
-        # Distance to target
-        if target_pos != (-1, -1):
-            target_dist = abs(robot_pos[0] - target_pos[0]) + abs(robot_pos[1] - target_pos[1])
+        task_info = ""
+        if observation['task_info']:
+            target = observation['task_info']['target']
+            carrying = observation['task_info']['carrying']
+            distance = observation['task_info']['distance']
+            task_info = f"t_{target[0]}_{target[1]}_c{int(carrying)}_d{min(distance, 20)}"
         else:
-            target_dist = -1
+            task_info = "no_task"
         
-        # Local environment (3x3 area around robot)
-        local_env = []
-        for dx in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                if dx == 0 and dy == 0:
-                    continue  # Skip robot's own position
-                
-                check_pos = (robot_pos[0] + dx, robot_pos[1] + dy)
-                
-                # Check bounds
-                if (check_pos[0] < 0 or check_pos[0] >= state['grid_size'][0] or
-                    check_pos[1] < 0 or check_pos[1] >= state['grid_size'][1]):
-                    local_env.append(1)  # Out of bounds = obstacle
-                    continue
-                
-                # Check for obstacles
-                if (check_pos in state['static_obstacles'] or 
-                    check_pos in state['dynamic_obstacles'].values()):
-                    local_env.append(1)  # Obstacle
-                # Check for other robots
-                elif any(other_robot['position'] == check_pos 
-                        for other_id, other_robot in state['robots'].items() 
-                        if other_id != robot_id):
-                    local_env.append(2)  # Other robot
-                else:
-                    local_env.append(0)  # Free space
+        # Local environment (simplified to reduce state space)
+        local_obs = len(observation['local_obstacles'])
+        local_robots = len(observation['local_robots'])
         
-        # Task completion progress
-        completed_tasks = len(state['completed_tasks'])
-        total_tasks = len(state['tasks'])
+        # Create compact state representation
+        state_key = f"p_{pos[0]}_{pos[1]}_{task_info}_o{local_obs}_r{local_robots}"
         
-        # Simplify state to reduce dimensionality
-        # Discretize position relative to grid
-        rel_pos_x = min(pos_x // 3, 4)  # Divide grid into regions
-        rel_pos_y = min(pos_y // 3, 4)
-        
-        # Discretize target distance
-        if target_dist == -1:
-            dist_category = 0  # No target
-        elif target_dist <= 2:
-            dist_category = 1  # Very close
-        elif target_dist <= 5:
-            dist_category = 2  # Close
-        elif target_dist <= 10:
-            dist_category = 3  # Medium
-        else:
-            dist_category = 4  # Far
-        
-        # Task state
-        task_state = 0  # No task
-        if carrying_task is not None:
-            task_state = 2  # Carrying task
-        elif assigned_task is not None:
-            task_state = 1  # Assigned task
-        
-        # Create state tuple (keep it reasonably sized)
-        state_tuple = (
-            rel_pos_x,
-            rel_pos_y,
-            task_state,
-            dist_category,
-            tuple(local_env[:4]),  # Only use 4 neighboring positions to reduce state space
-            min(completed_tasks, 5)  # Cap completed tasks to reduce state space
-        )
-        
-        return state_tuple
+        return state_key
     
-    def choose_action(self, robot_id: int, state_repr: tuple, training=True) -> int:
-        """Choose action using epsilon-greedy policy"""
-        if training and random.random() < self.epsilon:
+    def choose_action(self, observation: Dict, other_robots_positions: List[Tuple] = None) -> int:
+        """
+        Choose action using epsilon-greedy policy with coordination considerations
+        """
+        if observation is None:
+            return 0  # Stay action for terminal states
+        
+        state_key = self.get_state_key(observation)
+        
+        # Epsilon-greedy action selection
+        if random.random() < self.epsilon:
             # Exploration: random action
-            return random.randint(0, 4)
+            action = random.choice(self.actions)
         else:
-            # Exploitation: best known action
-            q_values = self.q_tables[robot_id][state_repr]
-            return np.argmax(q_values)
-    
-    def update_q_table(self, robot_id: int, state: tuple, action: int, 
-                      reward: float, next_state: tuple, done: bool):
-        """Update Q-table using Q-learning update rule"""
-        current_q = self.q_tables[robot_id][state][action]
+            # Exploitation: best action from Q-table with coordination
+            q_values = self.q_table[state_key]
+            
+            if not q_values:
+                # If no Q-values yet, choose random action
+                action = random.choice(self.actions)
+            else:
+                # Get action with highest Q-value, considering coordination
+                coordinated_q_values = self._apply_coordination_bonus(
+                    observation, q_values, other_robots_positions)
+                action = max(coordinated_q_values.keys(), 
+                           key=coordinated_q_values.get)
         
+        return action
+    
+    def _apply_coordination_bonus(self, observation: Dict, q_values: Dict, 
+                                other_robots_positions: List[Tuple] = None) -> Dict:
+        """
+        Apply coordination bonus/penalty to Q-values to avoid conflicts
+        """
+        if not other_robots_positions:
+            return q_values
+        
+        current_pos = observation['position']
+        coordinated_q_values = q_values.copy()
+        
+        # Actions: 0=stay, 1=up, 2=right, 3=down, 4=left
+        action_moves = [(0, 0), (-1, 0), (0, 1), (1, 0), (0, -1)]
+        
+        for action, q_value in q_values.items():
+            dx, dy = action_moves[action]
+            next_pos = (current_pos[0] + dx, current_pos[1] + dy)
+            
+            # Check if this action would lead to collision with other robots
+            collision_penalty = 0
+            for other_pos in other_robots_positions:
+                if next_pos == other_pos:
+                    collision_penalty += 10  # Strong penalty for direct collision
+                elif self._manhattan_distance(next_pos, other_pos) <= 1:
+                    collision_penalty += 2   # Mild penalty for getting too close
+            
+            # Apply coordination adjustment
+            coordinated_q_values[action] = q_value - (collision_penalty * self.coordination_weight)
+        
+        return coordinated_q_values
+    
+    def update_q_value(self, state: str, action: int, reward: float, 
+                      next_state: str, done: bool):
+        """
+        Update Q-value using Q-learning update rule
+        """
+        # Current Q-value
+        current_q = self.q_table[state][action]
+        
+        # Best next action Q-value
         if done:
-            target_q = reward
+            max_next_q = 0
         else:
-            next_q_values = self.q_tables[robot_id][next_state]
-            target_q = reward + self.discount_factor * np.max(next_q_values)
+            next_q_values = self.q_table[next_state]
+            max_next_q = max(next_q_values.values()) if next_q_values else 0
         
         # Q-learning update
-        self.q_tables[robot_id][state][action] += self.learning_rate * (target_q - current_q)
+        new_q = current_q + self.learning_rate * (
+            reward + self.discount_factor * max_next_q - current_q)
+        
+        self.q_table[state][action] = new_q
+        
+        # Update statistics
+        self.cumulative_reward += reward
     
-    def calculate_shaped_reward(self, robot_id: int, state: dict, action: int, 
-                              reward: float, old_state: dict) -> float:
-        """
-        Calculate shaped reward to guide learning towards objectives:
-        1. Minimizing travel time & path length
-        2. Collision-free navigation
-        3. Task allocation & coordination
-        """
-        shaped_reward = reward
-        
-        robot = state['robots'][robot_id]
-        old_robot = old_state['robots'][robot_id] if old_state else robot
-        
-        robot_pos = robot['position']
-        old_pos = old_robot['position']
-        
-        # 1. TRAVEL TIME & PATH LENGTH OPTIMIZATION
-        # Reward for moving towards assigned task
-        if robot['assigned_task'] is not None:
-            task = state['tasks'][robot['assigned_task']]
-            target = task['pickup'] if robot['carrying_task'] is None else task['dropoff']
-            
-            # Distance-based reward
-            old_dist = abs(old_pos[0] - target[0]) + abs(old_pos[1] - target[1])
-            new_dist = abs(robot_pos[0] - target[0]) + abs(robot_pos[1] - target[1])
-            
-            if new_dist < old_dist:
-                shaped_reward += 2.0  # Reward for getting closer
-            elif new_dist > old_dist:
-                shaped_reward -= 1.0  # Penalty for moving away
-                
-            # Bonus for reaching target
-            if robot_pos == target:
-                shaped_reward += 10.0
-        
-        # 2. COLLISION-FREE NAVIGATION
-        # Penalty for staying idle too long (encourage movement)
-        if robot['idle_time'] > 3:
-            shaped_reward -= robot['idle_time'] * 0.5
-        
-        # Reward for avoiding congested areas
-        nearby_robots = sum(1 for other_id, other_robot in state['robots'].items()
-                           if other_id != robot_id and 
-                           abs(other_robot['position'][0] - robot_pos[0]) + 
-                           abs(other_robot['position'][1] - robot_pos[1]) <= 2)
-        if nearby_robots > 1:
-            shaped_reward -= nearby_robots * 0.5  # Penalty for crowding
-        
-        # 3. TASK ALLOCATION & COORDINATION
-        # Reward for task pickup
-        if (robot['carrying_task'] is not None and 
-            old_robot['carrying_task'] is None):
-            shaped_reward += 15.0
-        
-        # Large reward for task completion
-        old_completed = len(old_state['completed_tasks']) if old_state else 0
-        new_completed = len(state['completed_tasks'])
-        if new_completed > old_completed:
-            shaped_reward += 50.0
-        
-        # Efficiency bonus (reward for making progress)
-        if robot['assigned_task'] is not None or robot['carrying_task'] is not None:
-            shaped_reward += 1.0  # Small bonus for having purpose
-        
-        # Penalty for collisions (already in base reward, but emphasize)
-        if state['collision_count'] > (old_state['collision_count'] if old_state else 0):
-            shaped_reward -= 10.0
-        
-        return shaped_reward
+    def decay_epsilon(self):
+        """Decay exploration rate"""
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
     
-    def train(self, num_episodes=1000, max_steps_per_episode=300, 
-              save_interval=100, verbose=True):
+    def _manhattan_distance(self, pos1: Tuple, pos2: Tuple) -> int:
+        """Calculate Manhattan distance between two positions"""
+        return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
+    
+    def save_model(self, filepath: str):
+        """Save the Q-table and agent parameters"""
+        model_data = {
+            'robot_id': self.robot_id,
+            'q_table': dict(self.q_table),
+            'epsilon': self.epsilon,
+            'training_episodes': self.training_episodes,
+            'episode_rewards': self.episode_rewards,
+            'collision_count': self.collision_count
+        }
+        
+        with open(filepath, 'wb') as f:
+            pickle.dump(model_data, f)
+        
+        print(f"Model saved for robot {self.robot_id} to {filepath}")
+    
+    def load_model(self, filepath: str):
+        """Load Q-table and agent parameters"""
+        with open(filepath, 'rb') as f:
+            model_data = pickle.load(f)
+        
+        self.q_table = defaultdict(lambda: defaultdict(float), model_data['q_table'])
+        self.epsilon = model_data['epsilon']
+        self.training_episodes = model_data['training_episodes']
+        self.episode_rewards = model_data.get('episode_rewards', [])
+        self.collision_count = model_data.get('collision_count', 0)
+        
+        print(f"Model loaded for robot {self.robot_id} from {filepath}")
+
+
+class MultiRobotQLearningCoordinator:
+    """
+    Coordinator for multiple Q-learning agents with advanced coordination mechanisms
+    """
+    
+    def __init__(self, 
+                 environment: MultiRobotEnvironment,
+                 learning_rate: float = 0.1,
+                 discount_factor: float = 0.95,
+                 epsilon: float = 1.0,
+                 epsilon_decay: float = 0.995,
+                 epsilon_min: float = 0.01):
         """
-        Train Q-learning agents
+        Initialize multi-robot Q-learning coordinator
+        """
+        self.env = environment
+        self.num_robots = environment.num_robots
+        self.grid_size = environment.grid_size
+        
+        # Create Q-learning agents for each robot
+        self.agents = {}
+        for robot_id in range(self.num_robots):
+            self.agents[robot_id] = QLearningAgent(
+                robot_id=robot_id,
+                grid_size=self.grid_size,
+                learning_rate=learning_rate,
+                discount_factor=discount_factor,
+                epsilon=epsilon,
+                epsilon_decay=epsilon_decay,
+                epsilon_min=epsilon_min
+            )
+        
+        # Training statistics
+        self.episode_count = 0
+        self.training_history = []
+        self.performance_metrics = []
+        
+        # Coordination mechanisms
+        self.communication_enabled = True
+        self.task_auction_enabled = True
+        
+    def train(self, episodes: int = 1000, verbose: bool = True, 
+              save_interval: int = 100):
+        """
+        Train all agents using Q-learning with coordination
         
         Args:
-            num_episodes: Number of training episodes
-            max_steps_per_episode: Maximum steps per episode
-            save_interval: Save progress every N episodes
-            verbose: Print training progress
+            episodes: Number of training episodes
+            verbose: Whether to print training progress
+            save_interval: Save models every N episodes
         """
-        if verbose:
-            print(f"Starting Q-Learning training for {num_episodes} episodes...")
-            print(f"Max steps per episode: {max_steps_per_episode}")
+        print(f"Starting Q-Learning training for {self.num_robots} robots")
+        print(f"Training for {episodes} episodes...")
+        print("="*60)
         
-        best_completion_rate = 0.0
-        training_start_time = time.time()
+        episode_rewards_history = []
         
-        for episode in range(num_episodes):
-            # Reset environment
+        for episode in range(episodes):
+            # Reset environment for new episode
             state = self.env.reset()
-            episode_rewards = {robot_id: 0 for robot_id in self.env.robots.keys()}
-            episode_length = 0
             
-            # Get initial state representations
-            state_reprs = {}
-            for robot_id in self.env.robots.keys():
-                state_reprs[robot_id] = self.get_state_representation(robot_id, state)
+            # Get initial observations for all robots
+            observations = {}
+            for robot_id in self.agents.keys():
+                observations[robot_id] = self.env.get_robot_observation(robot_id)
             
-            done = False
-            old_state = None
+            # Store initial states
+            states = {}
+            for robot_id, agent in self.agents.items():
+                states[robot_id] = agent.get_state_key(observations[robot_id])
             
-            while not done and episode_length < max_steps_per_episode:
-                # Choose actions for all robots
-                actions = {}
-                for robot_id in self.env.robots.keys():
-                    actions[robot_id] = self.choose_action(robot_id, state_reprs[robot_id])
+            episode_rewards = {robot_id: 0 for robot_id in self.agents.keys()}
+            step_count = 0
+            max_steps = self.env.max_steps
+            
+            while step_count < max_steps:
+                # Get actions from all agents with coordination
+                actions = self._get_coordinated_actions(observations)
                 
-                # Execute actions
-                old_state = state.copy()
+                # Execute actions in environment
                 next_state, rewards, done, info = self.env.step(actions)
                 
-                # Get next state representations
-                next_state_reprs = {}
-                for robot_id in self.env.robots.keys():
-                    next_state_reprs[robot_id] = self.get_state_representation(robot_id, next_state)
+                # Get next observations
+                next_observations = {}
+                for robot_id in self.agents.keys():
+                    next_observations[robot_id] = self.env.get_robot_observation(robot_id)
                 
-                # Update Q-tables and calculate shaped rewards
-                for robot_id in self.env.robots.keys():
-                    # Calculate shaped reward
-                    shaped_reward = self.calculate_shaped_reward(
-                        robot_id, next_state, actions[robot_id], 
-                        rewards[robot_id], old_state
-                    )
+                # Update Q-values for all agents
+                for robot_id, agent in self.agents.items():
+                    current_state = states[robot_id]
+                    action = actions[robot_id]
+                    reward = rewards[robot_id]
+                    next_state_key = agent.get_state_key(next_observations[robot_id])
                     
-                    # Update Q-table
-                    self.update_q_table(
-                        robot_id, 
-                        state_reprs[robot_id], 
-                        actions[robot_id], 
-                        shaped_reward, 
-                        next_state_reprs[robot_id], 
-                        done
-                    )
+                    # Enhanced reward shaping for better learning
+                    shaped_reward = self._shape_reward(
+                        robot_id, reward, observations[robot_id], 
+                        next_observations[robot_id], info)
+                    
+                    agent.update_q_value(current_state, action, shaped_reward, 
+                                       next_state_key, done)
                     
                     episode_rewards[robot_id] += shaped_reward
                 
-                # Update state
-                state = next_state
-                state_reprs = next_state_reprs
-                episode_length += 1
-            
-            # Decay epsilon
-            self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
-            
-            # Record statistics
-            metrics = self.env.get_metrics()
-            self.training_stats['episode_rewards'].append(sum(episode_rewards.values()))
-            self.training_stats['episode_lengths'].append(episode_length)
-            self.training_stats['task_completion_rates'].append(metrics['task_completion_rate'])
-            self.training_stats['collision_counts'].append(metrics['collision_count'])
-            self.training_stats['epsilon_values'].append(self.epsilon)
-            self.training_stats['q_table_sizes'].append(
-                sum(len(q_table) for q_table in self.q_tables.values())
-            )
-            
-            # Track best performance
-            if metrics['task_completion_rate'] > best_completion_rate:
-                best_completion_rate = metrics['task_completion_rate']
-            
-            # Print progress
-            if verbose and (episode + 1) % save_interval == 0:
-                avg_reward = np.mean(self.training_stats['episode_rewards'][-save_interval:])
-                avg_completion = np.mean(self.training_stats['task_completion_rates'][-save_interval:])
-                avg_collisions = np.mean(self.training_stats['collision_counts'][-save_interval:])
+                # Update states and observations
+                states = {robot_id: agent.get_state_key(next_observations[robot_id]) 
+                         for robot_id, agent in self.agents.items()}
+                observations = next_observations
+                step_count += 1
                 
-                print(f"Episode {episode + 1}/{num_episodes}")
-                print(f"  Avg Reward: {avg_reward:.2f}")
-                print(f"  Avg Completion Rate: {avg_completion:.1%}")
-                print(f"  Avg Collisions: {avg_collisions:.1f}")
-                print(f"  Epsilon: {self.epsilon:.3f}")
-                print(f"  Q-table Size: {sum(len(q) for q in self.q_tables.values())}")
-                print(f"  Best Completion Rate: {best_completion_rate:.1%}")
+                if done:
+                    break
+            
+            # Decay exploration rates
+            for agent in self.agents.values():
+                agent.decay_epsilon()
+                agent.training_episodes += 1
+            
+            # Record episode statistics
+            total_episode_reward = sum(episode_rewards.values())
+            episode_rewards_history.append(total_episode_reward)
+            
+            # Get episode metrics
+            metrics = self.env.get_metrics()
+            self.performance_metrics.append(metrics)
+            
+            # Update training history
+            self.training_history.append({
+                'episode': episode,
+                'total_reward': total_episode_reward,
+                'individual_rewards': episode_rewards.copy(),
+                'metrics': metrics,
+                'epsilon': self.agents[0].epsilon  # All agents have same epsilon
+            })
+            
+            # Verbose output
+            if verbose and (episode + 1) % 50 == 0:
+                avg_reward = np.mean(episode_rewards_history[-50:])
+                success_rate = np.mean([m['success'] for m in self.performance_metrics[-50:]])
+                avg_completion = np.mean([m['task_completion_rate'] for m in self.performance_metrics[-50:]])
+                avg_collisions = np.mean([m['collision_count'] for m in self.performance_metrics[-50:]])
+                
+                print(f"Episode {episode + 1:4d}: "
+                      f"Avg Reward: {avg_reward:8.2f}, "
+                      f"Success Rate: {success_rate:.2%}, "
+                      f"Completion: {avg_completion:.2%}, "
+                      f"Collisions: {avg_collisions:.1f}, "
+                      f"Epsilon: {self.agents[0].epsilon:.3f}")
+            
+            # Save models periodically
+            if (episode + 1) % save_interval == 0:
+                self.save_models(f"models_episode_{episode + 1}")
+            
+            self.episode_count += 1
         
-        training_time = time.time() - training_start_time
-        if verbose:
-            print(f"\nTraining completed in {training_time:.1f} seconds")
-            print(f"Final epsilon: {self.epsilon:.3f}")
-            print(f"Best completion rate achieved: {best_completion_rate:.1%}")
+        print("\nTraining completed!")
+        self._print_training_summary()
     
-    def evaluate(self, num_episodes=20, max_steps_per_episode=300, verbose=True):
+    def _get_coordinated_actions(self, observations: Dict) -> Dict[int, int]:
         """
-        Evaluate trained Q-learning agents
-        
-        Returns:
-            dict: Evaluation metrics
+        Get actions for all robots with coordination mechanisms
         """
-        if verbose:
-            print(f"Evaluating Q-Learning agents over {num_episodes} episodes...")
+        actions = {}
         
-        evaluation_metrics = []
-        episode_details = []
+        # Get current positions for coordination
+        current_positions = []
+        for robot_id, obs in observations.items():
+            if obs:
+                current_positions.append(obs['position'])
+            else:
+                current_positions.append(None)
+        
+        # Get actions from each agent
+        for robot_id, agent in self.agents.items():
+            if observations[robot_id] is not None:
+                # Get positions of other robots
+                other_positions = [pos for i, pos in enumerate(current_positions) 
+                                 if i != robot_id and pos is not None]
+                
+                action = agent.choose_action(observations[robot_id], other_positions)
+                actions[robot_id] = action
+            else:
+                actions[robot_id] = 0  # Stay action if no observation
+        
+        # Apply additional coordination rules
+        actions = self._resolve_action_conflicts(actions, observations)
+        
+        return actions
+    
+    def _resolve_action_conflicts(self, actions: Dict[int, int], 
+                                observations: Dict) -> Dict[int, int]:
+        """
+        Resolve potential conflicts between robot actions
+        """
+        # Actions: 0=stay, 1=up, 2=right, 3=down, 4=left
+        action_moves = [(0, 0), (-1, 0), (0, 1), (1, 0), (0, -1)]
+        
+        # Calculate intended next positions
+        intended_positions = {}
+        for robot_id, action in actions.items():
+            if observations[robot_id] is not None:
+                current_pos = observations[robot_id]['position']
+                dx, dy = action_moves[action]
+                next_pos = (current_pos[0] + dx, current_pos[1] + dy)
+                intended_positions[robot_id] = next_pos
+        
+        # Check for conflicts and resolve them
+        resolved_actions = actions.copy()
+        position_conflicts = {}
+        
+        # Find robots intending to move to the same position
+        for robot_id, next_pos in intended_positions.items():
+            if next_pos not in position_conflicts:
+                position_conflicts[next_pos] = []
+            position_conflicts[next_pos].append(robot_id)
+        
+        # Resolve conflicts by having lower-priority robots stay
+        for next_pos, conflicting_robots in position_conflicts.items():
+            if len(conflicting_robots) > 1:
+                # Priority based on robot ID and current task status
+                def get_priority(robot_id):
+                    obs = observations[robot_id]
+                    if obs and obs['task_info']:
+                        if obs['task_info']['carrying']:
+                            return 10  # Highest priority for carrying robots
+                        else:
+                            return 5   # Medium priority for assigned robots
+                    return robot_id    # Default priority by ID
+                
+                # Sort by priority (higher priority first)
+                conflicting_robots.sort(key=get_priority, reverse=True)
+                
+                # Keep highest priority robot's action, others stay
+                for i, robot_id in enumerate(conflicting_robots):
+                    if i > 0:  # Not the highest priority
+                        resolved_actions[robot_id] = 0  # Stay action
+        
+        return resolved_actions
+    
+    def _shape_reward(self, robot_id: int, base_reward: float, 
+                     current_obs: Dict, next_obs: Dict, info: Dict) -> float:
+        """
+        Apply reward shaping to improve learning efficiency
+        """
+        shaped_reward = base_reward
+        
+        if current_obs is None or next_obs is None:
+            return shaped_reward
+        
+        # Reward for moving towards task objectives
+        if (current_obs.get('task_info') and next_obs.get('task_info') and
+            current_obs['task_info'] is not None and next_obs['task_info'] is not None):
+            
+            current_distance = current_obs['task_info']['distance']
+            next_distance = next_obs['task_info']['distance']
+            
+            # Reward for getting closer to target
+            if next_distance < current_distance:
+                shaped_reward += 2  # Progress bonus
+            elif next_distance > current_distance:
+                shaped_reward -= 1  # Regress penalty
+        
+        # Penalty for excessive collisions
+        if info.get('collisions_this_step', False):
+            shaped_reward -= 10
+        
+        # Reward for efficient movement (not staying idle unless necessary)
+        if (current_obs['position'] == next_obs['position'] and 
+            current_obs.get('task_info') is not None):
+            shaped_reward -= 0.5  # Small penalty for unnecessary idling
+        
+        # Bonus for coordination (staying away from other robots when not necessary)
+        if len(next_obs.get('local_robots', [])) == 0:
+            shaped_reward += 0.5  # Small bonus for avoiding crowding
+        
+        return shaped_reward
+    
+    def evaluate(self, episodes: int = 10, render: bool = False) -> Dict:
+        """
+        Evaluate the trained agents
+        """
+        print(f"Evaluating trained agents over {episodes} episodes...")
+        
+        evaluation_results = []
         
         # Temporarily disable exploration
-        old_epsilon = self.epsilon
-        self.epsilon = 0.0  # Pure exploitation
+        original_epsilons = {}
+        for robot_id, agent in self.agents.items():
+            original_epsilons[robot_id] = agent.epsilon
+            agent.epsilon = 0.0  # Pure exploitation
         
-        for episode in range(num_episodes):
+        for episode in range(episodes):
             # Reset environment
             state = self.env.reset()
-            episode_length = 0
-            episode_rewards = {robot_id: 0 for robot_id in self.env.robots.keys()}
             
-            # Get initial state representations
-            state_reprs = {}
-            for robot_id in self.env.robots.keys():
-                state_reprs[robot_id] = self.get_state_representation(robot_id, state)
+            # Get initial observations
+            observations = {}
+            for robot_id in self.agents.keys():
+                observations[robot_id] = self.env.get_robot_observation(robot_id)
             
-            done = False
+            episode_rewards = {robot_id: 0 for robot_id in self.agents.keys()}
+            step_count = 0
             
-            while not done and episode_length < max_steps_per_episode:
-                # Choose actions (no exploration)
-                actions = {}
-                for robot_id in self.env.robots.keys():
-                    actions[robot_id] = self.choose_action(robot_id, state_reprs[robot_id], training=False)
+            while step_count < self.env.max_steps:
+                # Get actions (no exploration)
+                actions = self._get_coordinated_actions(observations)
                 
                 # Execute actions
                 next_state, rewards, done, info = self.env.step(actions)
                 
-                # Update state representations
-                for robot_id in self.env.robots.keys():
-                    state_reprs[robot_id] = self.get_state_representation(robot_id, next_state)
+                # Update observations
+                for robot_id in self.agents.keys():
+                    observations[robot_id] = self.env.get_robot_observation(robot_id)
                     episode_rewards[robot_id] += rewards[robot_id]
                 
-                state = next_state
-                episode_length += 1
+                step_count += 1
+                
+                if done:
+                    break
             
-            # Get final metrics
+            # Get episode metrics
             metrics = self.env.get_metrics()
-            evaluation_metrics.append(metrics)
+            metrics['episode_rewards'] = episode_rewards
+            metrics['total_reward'] = sum(episode_rewards.values())
+            evaluation_results.append(metrics)
             
-            episode_details.append({
-                'episode': episode + 1,
-                'completion_rate': metrics['task_completion_rate'],
-                'collisions': metrics['collision_count'],
-                'steps': episode_length,
-                'total_reward': sum(episode_rewards.values()),
-                'path_efficiency': metrics['avg_path_efficiency']
-            })
-            
-            if verbose:
-                print(f"Episode {episode + 1}: "
-                      f"Completion {metrics['task_completion_rate']:.1%}, "
-                      f"Collisions {metrics['collision_count']}, "
-                      f"Steps {episode_length}")
+            if render and episode == 0:  # Render first episode
+                print(f"\nEvaluation Episode {episode + 1}")
+                self.env.render(show_paths=True)
         
-        # Restore epsilon
-        self.epsilon = old_epsilon
+        # Restore original exploration rates
+        for robot_id, agent in self.agents.items():
+            agent.epsilon = original_epsilons[robot_id]
         
-        # Calculate aggregate statistics
-        avg_metrics = {}
-        for key in evaluation_metrics[0].keys():
-            if isinstance(evaluation_metrics[0][key], (int, float)):
-                values = [m[key] for m in evaluation_metrics]
-                avg_metrics[f'mean_{key}'] = np.mean(values)
-                avg_metrics[f'std_{key}'] = np.std(values)
-                avg_metrics[f'min_{key}'] = np.min(values)
-                avg_metrics[f'max_{key}'] = np.max(values)
+        # Calculate aggregate metrics
+        aggregate_metrics = self._calculate_aggregate_metrics(evaluation_results)
         
-        # Success rate (completion rate > 80% and collisions < 5)
-        success_episodes = sum(1 for m in evaluation_metrics 
-                             if m['task_completion_rate'] > 0.8 and m['collision_count'] < 5)
-        avg_metrics['success_rate'] = success_episodes / num_episodes
-        
-        if verbose:
-            print(f"\nEvaluation Results:")
-            print(f"Success Rate: {avg_metrics['success_rate']:.1%}")
-            print(f"Average Task Completion: {avg_metrics['mean_task_completion_rate']:.1%} ± {avg_metrics['std_task_completion_rate']:.1%}")
-            print(f"Average Collisions: {avg_metrics['mean_collision_count']:.1f} ± {avg_metrics['std_collision_count']:.1f}")
-            print(f"Average Path Efficiency: {avg_metrics['mean_avg_path_efficiency']:.3f} ± {avg_metrics['std_avg_path_efficiency']:.3f}")
-            print(f"Average Steps: {avg_metrics['mean_total_steps']:.1f} ± {avg_metrics['std_total_steps']:.1f}")
-        
-        return avg_metrics, episode_details
+        return aggregate_metrics
     
-    def plot_training_progress(self, save_path=None):
-        """Plot training progress"""
+    def _calculate_aggregate_metrics(self, results: List[Dict]) -> Dict:
+        """Calculate aggregate evaluation metrics"""
+        metrics = {}
+        
+        # Calculate averages and standard deviations
+        numerical_keys = ['task_completion_rate', 'collision_count', 'avg_path_length',
+                         'total_distance', 'throughput', 'avg_path_efficiency', 'total_steps']
+        
+        for key in numerical_keys:
+            values = [r[key] for r in results if key in r]
+            if values:
+                metrics[f'avg_{key}'] = np.mean(values)
+                metrics[f'std_{key}'] = np.std(values)
+        
+        # Success rate
+        success_count = sum(1 for r in results if r.get('success', False))
+        metrics['success_rate'] = success_count / len(results)
+        
+        # Reward statistics
+        total_rewards = [r['total_reward'] for r in results]
+        metrics['avg_total_reward'] = np.mean(total_rewards)
+        metrics['std_total_reward'] = np.std(total_rewards)
+        
+        return metrics
+    
+    def _print_training_summary(self):
+        """Print comprehensive training summary"""
+        if not self.training_history:
+            return
+        
+        print("\n" + "="*60)
+        print("TRAINING SUMMARY")
+        print("="*60)
+        
+        # Recent performance (last 100 episodes)
+        recent_episodes = self.training_history[-100:]
+        
+        avg_reward = np.mean([ep['total_reward'] for ep in recent_episodes])
+        success_rate = np.mean([ep['metrics']['success'] for ep in recent_episodes])
+        avg_completion = np.mean([ep['metrics']['task_completion_rate'] for ep in recent_episodes])
+        avg_collisions = np.mean([ep['metrics']['collision_count'] for ep in recent_episodes])
+        final_epsilon = recent_episodes[-1]['epsilon']
+        
+        print(f"Episodes Trained: {self.episode_count}")
+        print(f"Final Epsilon: {final_epsilon:.4f}")
+        print(f"\nRecent Performance (last {len(recent_episodes)} episodes):")
+        print(f"  Average Total Reward: {avg_reward:.2f}")
+        print(f"  Success Rate: {success_rate:.2%}")
+        print(f"  Task Completion Rate: {avg_completion:.2%}")
+        print(f"  Average Collisions: {avg_collisions:.2f}")
+        
+        print(f"\nObjectives Achievement:")
+        print(f"  1. Travel Time & Path Length: {'✓' if avg_completion > 0.7 else '✗'} "
+              f"({avg_completion:.1%} completion rate)")
+        print(f"  2. Collision-Free Navigation: {'✓' if avg_collisions < 3 else '✗'} "
+              f"({avg_collisions:.1f} avg collisions)")
+        print(f"  3. Multi-Robot Coordination: {'✓' if success_rate > 0.5 else '✗'} "
+              f"({success_rate:.1%} success rate)")
+    
+    def plot_training_progress(self, save_path: str = None):
+        """Plot training progress and metrics"""
+        if not self.training_history:
+            print("No training history to plot")
+            return
+        
         fig, axes = plt.subplots(2, 3, figsize=(18, 12))
         fig.suptitle('Q-Learning Training Progress', fontsize=16)
         
-        # Episode rewards
-        axes[0, 0].plot(self.training_stats['episode_rewards'])
-        axes[0, 0].set_title('Episode Rewards')
+        episodes = [ep['episode'] for ep in self.training_history]
+        
+        # Total rewards
+        total_rewards = [ep['total_reward'] for ep in self.training_history]
+        axes[0, 0].plot(episodes, total_rewards, alpha=0.7)
+        axes[0, 0].plot(episodes, self._smooth(total_rewards, 50), 'r-', linewidth=2)
+        axes[0, 0].set_title('Total Episode Rewards')
         axes[0, 0].set_xlabel('Episode')
-        axes[0, 0].set_ylabel('Total Reward')
+        axes[0, 0].set_ylabel('Reward')
         axes[0, 0].grid(True)
         
-        # Task completion rates
-        axes[0, 1].plot(self.training_stats['task_completion_rates'])
+        # Task completion rate
+        completion_rates = [ep['metrics']['task_completion_rate'] for ep in self.training_history]
+        axes[0, 1].plot(episodes, completion_rates, alpha=0.7)
+        axes[0, 1].plot(episodes, self._smooth(completion_rates, 50), 'g-', linewidth=2)
         axes[0, 1].set_title('Task Completion Rate')
         axes[0, 1].set_xlabel('Episode')
         axes[0, 1].set_ylabel('Completion Rate')
         axes[0, 1].set_ylim(0, 1)
         axes[0, 1].grid(True)
         
-        # Collision counts
-        axes[0, 2].plot(self.training_stats['collision_counts'])
+        # Collision count
+        collisions = [ep['metrics']['collision_count'] for ep in self.training_history]
+        axes[0, 2].plot(episodes, collisions, alpha=0.7)
+        axes[0, 2].plot(episodes, self._smooth(collisions, 50), 'r-', linewidth=2)
         axes[0, 2].set_title('Collision Count')
         axes[0, 2].set_xlabel('Episode')
         axes[0, 2].set_ylabel('Collisions')
         axes[0, 2].grid(True)
         
-        # Episode lengths
-        axes[1, 0].plot(self.training_stats['episode_lengths'])
-        axes[1, 0].set_title('Episode Length')
+        # Success rate
+        success_rate_window = 100
+        success_rates = []
+        for i in range(len(self.training_history)):
+            start_idx = max(0, i - success_rate_window + 1)
+            window_episodes = self.training_history[start_idx:i+1]
+            success_rate = np.mean([ep['metrics']['success'] for ep in window_episodes])
+            success_rates.append(success_rate)
+        
+        axes[1, 0].plot(episodes, success_rates, 'purple', linewidth=2)
+        axes[1, 0].set_title(f'Success Rate (rolling {success_rate_window} episodes)')
         axes[1, 0].set_xlabel('Episode')
-        axes[1, 0].set_ylabel('Steps')
+        axes[1, 0].set_ylabel('Success Rate')
+        axes[1, 0].set_ylim(0, 1)
         axes[1, 0].grid(True)
         
-        # Epsilon decay
-        axes[1, 1].plot(self.training_stats['epsilon_values'])
-        axes[1, 1].set_title('Exploration Rate (Epsilon)')
+        # Average path length
+        path_lengths = [ep['metrics']['avg_path_length'] for ep in self.training_history]
+        axes[1, 1].plot(episodes, path_lengths, alpha=0.7)
+        axes[1, 1].plot(episodes, self._smooth(path_lengths, 50), 'orange', linewidth=2)
+        axes[1, 1].set_title('Average Path Length')
         axes[1, 1].set_xlabel('Episode')
-        axes[1, 1].set_ylabel('Epsilon')
+        axes[1, 1].set_ylabel('Path Length')
         axes[1, 1].grid(True)
         
-        # Q-table growth
-        axes[1, 2].plot(self.training_stats['q_table_sizes'])
-        axes[1, 2].set_title('Q-Table Size')
+        # Epsilon decay
+        epsilons = [ep['epsilon'] for ep in self.training_history]
+        axes[1, 2].plot(episodes, epsilons, 'brown', linewidth=2)
+        axes[1, 2].set_title('Exploration Rate (Epsilon)')
         axes[1, 2].set_xlabel('Episode')
-        axes[1, 2].set_ylabel('Number of States')
+        axes[1, 2].set_ylabel('Epsilon')
+        axes[1, 2].set_ylim(0, 1)
         axes[1, 2].grid(True)
         
         plt.tight_layout()
@@ -522,251 +696,349 @@ class MultiRobotQLearning:
         
         plt.show()
     
-    def save_model(self, filepath):
-        """Save trained Q-tables and training stats"""
-        model_data = {
-            'q_tables': dict(self.q_tables),
-            'training_stats': self.training_stats,
-            'parameters': {
-                'learning_rate': self.learning_rate,
-                'discount_factor': self.discount_factor,
-                'epsilon_start': self.epsilon_start,
-                'epsilon_end': self.epsilon_end,
-                'epsilon_decay': self.epsilon_decay,
-                'current_epsilon': self.epsilon
-            }
+    def _smooth(self, data: List[float], window: int) -> List[float]:
+        """Apply moving average smoothing"""
+        smoothed = []
+        for i in range(len(data)):
+            start_idx = max(0, i - window + 1)
+            smoothed.append(np.mean(data[start_idx:i+1]))
+        return smoothed
+    
+    def save_models(self, directory: str):
+        """Save all agent models"""
+        import os
+        os.makedirs(directory, exist_ok=True)
+        
+        for robot_id, agent in self.agents.items():
+            filepath = os.path.join(directory, f"robot_{robot_id}_model.pkl")
+            agent.save_model(filepath)
+        
+        # Save coordinator metadata
+        metadata = {
+            'episode_count': self.episode_count,
+            'training_history': self.training_history[-100:],  # Keep last 100 episodes
+            'num_robots': self.num_robots,
+            'grid_size': self.grid_size
         }
         
-        with open(filepath, 'wb') as f:
-            pickle.dump(model_data, f)
+        with open(os.path.join(directory, "coordinator_metadata.json"), 'w') as f:
+            json.dump(metadata, f, indent=2)
         
-        print(f"Q-Learning model saved to {filepath}")
+        print(f"All models saved to {directory}/")
     
-    def load_model(self, filepath):
-        """Load trained Q-tables and training stats"""
-        with open(filepath, 'rb') as f:
-            model_data = pickle.load(f)
+    def load_models(self, directory: str):
+        """Load all agent models"""
+        import os
         
-        self.q_tables = defaultdict(lambda: defaultdict(lambda: np.zeros(self.num_actions)))
-        for robot_id, q_table in model_data['q_tables'].items():
-            self.q_tables[robot_id] = q_table
+        for robot_id, agent in self.agents.items():
+            filepath = os.path.join(directory, f"robot_{robot_id}_model.pkl")
+            if os.path.exists(filepath):
+                agent.load_model(filepath)
         
-        self.training_stats = model_data['training_stats']
+        # Load coordinator metadata if available
+        metadata_path = os.path.join(directory, "coordinator_metadata.json")
+        if os.path.exists(metadata_path):
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            self.episode_count = metadata.get('episode_count', 0)
+            self.training_history = metadata.get('training_history', [])
         
-        # Load parameters
-        params = model_data['parameters']
-        self.learning_rate = params['learning_rate']
-        self.discount_factor = params['discount_factor']
-        self.epsilon_start = params['epsilon_start']
-        self.epsilon_end = params['epsilon_end']
-        self.epsilon_decay = params['epsilon_decay']
-        self.epsilon = params['current_epsilon']
+        print(f"All models loaded from {directory}/")
+    
+    def run_demo(self, episodes: int = 3, render: bool = True, save_animation: bool = False):
+        """
+        Run a demonstration of the trained agents
+        """
+        print(f"Running demonstration for {episodes} episodes...")
         
-        print(f"Q-Learning model loaded from {filepath}")
-
-
-def compare_with_random_baseline(env: MultiRobotEnvironment, 
-                               trained_qlearning: MultiRobotQLearning,
-                               num_episodes=20):
-    """
-    Compare trained Q-learning performance with random baseline
-    """
-    print("Comparing Q-Learning vs Random Policy...")
-    print("=" * 50)
-    
-    # Evaluate Q-Learning
-    print("Evaluating Q-Learning Policy:")
-    ql_metrics, ql_details = trained_qlearning.evaluate(num_episodes, verbose=True)
-    
-    # Evaluate Random Policy
-    print(f"\nEvaluating Random Policy:")
-    random_metrics, random_details = env.benchmark_random_policy(num_episodes)
-    
-    # Comparison
-    print(f"\n📊 PERFORMANCE COMPARISON")
-    print("=" * 50)
-    
-    print(f"OBJECTIVE 1: Minimizing Travel Time & Path Length")
-    print(f"  Q-Learning Avg Steps: {ql_metrics['mean_total_steps']:.1f}")
-    print(f"  Random Avg Steps:     {random_metrics['avg_total_steps']:.1f}")
-    print(f"  Improvement: {((random_metrics['avg_total_steps'] - ql_metrics['mean_total_steps']) / random_metrics['avg_total_steps'] * 100):.1f}%")
-    
-    print(f"\n  Q-Learning Path Efficiency: {ql_metrics['mean_avg_path_efficiency']:.3f}")
-    print(f"  Random Path Efficiency:     {random_metrics['avg_avg_path_efficiency']:.3f}")
-    print(f"  Improvement: {((ql_metrics['mean_avg_path_efficiency'] - random_metrics['avg_avg_path_efficiency']) / random_metrics['avg_avg_path_efficiency'] * 100):.1f}%")
-    
-    print(f"\nOBJECTIVE 2: Collision-Free Navigation")
-    print(f"  Q-Learning Avg Collisions: {ql_metrics['mean_collision_count']:.1f}")
-    print(f"  Random Avg Collisions:     {random_metrics['avg_collision_count']:.1f}")
-    print(f"  Improvement: {((random_metrics['avg_collision_count'] - ql_metrics['mean_collision_count']) / max(random_metrics['avg_collision_count'], 1) * 100):.1f}%")
-    
-    print(f"\nOBJECTIVE 3: Task Allocation & Multi-Robot Coordination")
-    print(f"  Q-Learning Completion Rate: {ql_metrics['mean_task_completion_rate']:.1%}")
-    print(f"  Random Completion Rate:     {random_metrics['avg_task_completion_rate']:.1%}")
-    print(f"  Improvement: {((ql_metrics['mean_task_completion_rate'] - random_metrics['avg_task_completion_rate']) / max(random_metrics['avg_task_completion_rate'], 0.01) * 100):.1f}%")
-    
-    print(f"\nOVERALL SUCCESS RATE")
-    print(f"  Q-Learning Success Rate: {ql_metrics['success_rate']:.1%}")
-    print(f"  Random Success Rate:     {random_metrics['success_rate']:.1%}")
-    
-    return ql_metrics, random_metrics
+        # Set to exploitation mode
+        original_epsilons = {}
+        for robot_id, agent in self.agents.items():
+            original_epsilons[robot_id] = agent.epsilon
+            agent.epsilon = 0.0  # Pure exploitation
+        
+        for episode in range(episodes):
+            print(f"\n{'='*50}")
+            print(f"DEMONSTRATION EPISODE {episode + 1}")
+            print(f"{'='*50}")
+            
+            # Reset environment
+            state = self.env.reset()
+            
+            if render:
+                print("Initial State:")
+                self.env.render(show_paths=False)
+            
+            # Get initial observations
+            observations = {}
+            for robot_id in self.agents.keys():
+                observations[robot_id] = self.env.get_robot_observation(robot_id)
+            
+            step_count = 0
+            episode_rewards = {robot_id: 0 for robot_id in self.agents.keys()}
+            
+            while step_count < self.env.max_steps:
+                # Get coordinated actions
+                actions = self._get_coordinated_actions(observations)
+                
+                # Execute step
+                next_state, rewards, done, info = self.env.step(actions)
+                
+                # Update observations and rewards
+                for robot_id in self.agents.keys():
+                    observations[robot_id] = self.env.get_robot_observation(robot_id)
+                    episode_rewards[robot_id] += rewards[robot_id]
+                
+                step_count += 1
+                
+                # Print step information
+                if step_count % 20 == 0 or done:
+                    print(f"\nStep {step_count}:")
+                    print(f"  Actions: {[(rid, ['Stay', 'Up', 'Right', 'Down', 'Left'][action]) for rid, action in actions.items()]}")
+                    print(f"  Tasks completed: {info['tasks_completed']}/{info['total_tasks']}")
+                    if info['collisions_this_step']:
+                        print(f"  ⚠️ Collision occurred!")
+                
+                if done:
+                    break
+            
+            # Show final results
+            metrics = self.env.get_metrics()
+            
+            print(f"\nEpisode {episode + 1} Results:")
+            print(f"  Task Completion Rate: {metrics['task_completion_rate']:.1%}")
+            print(f"  Total Collisions: {metrics['collision_count']}")
+            print(f"  Average Path Length: {metrics['avg_path_length']:.2f}")
+            print(f"  Total Steps: {step_count}")
+            print(f"  Success: {'✅' if metrics['success'] else '❌'}")
+            print(f"  Episode Rewards: {episode_rewards}")
+            
+            if render:
+                print("\nFinal State:")
+                self.env.render(show_paths=True)
+            
+            if save_animation and episode == 0:
+                self.env.create_animation("qlearning_demo.gif")
+        
+        # Restore exploration rates
+        for robot_id, agent in self.agents.items():
+            agent.epsilon = original_epsilons[robot_id]
 
 
 def main():
     """
-    Main function to demonstrate Q-learning on multi-robot environment
+    Main function to demonstrate Q-learning implementation
     """
-    print("Multi-Robot Q-Learning Demonstration")
-    print("=" * 50)
+    print("Multi-Robot Q-Learning Path Planning Implementation")
+    print("="*60)
+    
+    # Environment parameters
+    GRID_SIZE = (10, 10)
+    NUM_ROBOTS = 3
+    NUM_TASKS = 4
+    SEED = 42
+    
+    # Q-learning hyperparameters
+    LEARNING_RATE = 0.1
+    DISCOUNT_FACTOR = 0.95
+    EPSILON = 1.0
+    EPSILON_DECAY = 0.995
+    EPSILON_MIN = 0.01
+    
+    # Training parameters
+    TRAINING_EPISODES = 800
+    EVALUATION_EPISODES = 10
+    
+    print(f"\nEnvironment Configuration:")
+    print(f"  Grid Size: {GRID_SIZE}")
+    print(f"  Robots: {NUM_ROBOTS}")
+    print(f"  Tasks: {NUM_TASKS}")
+    print(f"  Seed: {SEED}")
+    
+    print(f"\nQ-Learning Hyperparameters:")
+    print(f"  Learning Rate: {LEARNING_RATE}")
+    print(f"  Discount Factor: {DISCOUNT_FACTOR}")
+    print(f"  Initial Epsilon: {EPSILON}")
+    print(f"  Epsilon Decay: {EPSILON_DECAY}")
+    print(f"  Min Epsilon: {EPSILON_MIN}")
     
     # Create environment
     env = MultiRobotEnvironment(
-        grid_size=(10, 10),
-        num_robots=3, 
-        num_tasks=4,
-        seed=42
+        grid_size=GRID_SIZE,
+        num_robots=NUM_ROBOTS,
+        num_tasks=NUM_TASKS,
+        seed=SEED
     )
     
-    print(f"Environment created: {env.grid_size} grid, {env.num_robots} robots, {env.num_tasks} tasks")
+    # Create Q-learning coordinator
+    coordinator = MultiRobotQLearningCoordinator(
+        environment=env,
+        learning_rate=LEARNING_RATE,
+        discount_factor=DISCOUNT_FACTOR,
+        epsilon=EPSILON,
+        epsilon_decay=EPSILON_DECAY,
+        epsilon_min=EPSILON_MIN
+    )
     
     # Show initial environment
     print("\nInitial Environment:")
     env.render(show_paths=False)
     
-    # Initialize Q-learning
-    qlearning = MultiRobotQLearning(
-        env=env,
-        learning_rate=0.15,
-        discount_factor=0.95,
-        epsilon_start=1.0,
-        epsilon_end=0.05,
-        epsilon_decay=0.995
-    )
+    print("\nStarting Training Phase...")
     
     # Train the agents
-    print("\nStarting Q-Learning training...")
-    qlearning.train(
-        num_episodes=1500,
-        max_steps_per_episode=200,
-        save_interval=300,
-        verbose=True
+    coordinator.train(
+        episodes=TRAINING_EPISODES,
+        verbose=True,
+        save_interval=200
     )
     
     # Plot training progress
-    print("\nPlotting training progress...")
-    qlearning.plot_training_progress("qlearning_training_progress.png")
+    coordinator.plot_training_progress("training_progress.png")
     
     # Evaluate trained agents
-    print("\nEvaluating trained Q-Learning agents...")
-    eval_metrics, eval_details = qlearning.evaluate(num_episodes=30, verbose=True)
+    print("\nStarting Evaluation Phase...")
+    eval_results = coordinator.evaluate(
+        episodes=EVALUATION_EPISODES,
+        render=False
+    )
     
-    # Save trained model
-    qlearning.save_model("trained_qlearning_model.pkl")
-    
-    # Compare with random baseline
-    print("\nRunning comparison with random policy...")
-    ql_metrics, random_metrics = compare_with_random_baseline(env, qlearning, num_episodes=20)
-    
-    # Demonstrate trained agents
-    print("\nDemonstrating trained Q-learning agents...")
-    env.reset()
-    
-    # Run a demonstration episode
-    state = env.get_state()
-    done = False
-    step_count = 0
-    
-    print("Running demonstration episode...")
-    while not done and step_count < 150:
-        # Get actions from trained Q-learning agents
-        actions = {}
-        for robot_id in env.robots.keys():
-            state_repr = qlearning.get_state_representation(robot_id, state)
-            actions[robot_id] = qlearning.choose_action(robot_id, state_repr, training=False)
-        
-        # Execute step
-        state, rewards, done, info = env.step(actions)
-        step_count += 1
-        
-        if step_count % 25 == 0:
-            print(f"Step {step_count}: {info['tasks_completed']}/{info['total_tasks']} tasks completed")
-    
-    # Show final result
-    print(f"\nDemonstration completed in {step_count} steps")
-    final_metrics = env.get_metrics()
-    print(f"Final demonstration metrics:")
-    print(f"  Task completion rate: {final_metrics['task_completion_rate']:.1%}")
-    print(f"  Collisions: {final_metrics['collision_count']}")
-    print(f"  Path efficiency: {final_metrics['avg_path_efficiency']:.3f}")
-    
-    # Show final environment state
-    print("\nFinal environment state:")
-    env.render(show_paths=True)
-    
-    # Summary report
     print("\n" + "="*60)
-    print("MULTI-ROBOT Q-LEARNING EVALUATION SUMMARY")
+    print("EVALUATION RESULTS")
     print("="*60)
     
-    print("\nOBJECTIVE ACHIEVEMENT ANALYSIS:")
+    print(f"Success Rate: {eval_results['success_rate']:.1%}")
+    print(f"Average Task Completion: {eval_results['avg_task_completion_rate']:.1%} ± {eval_results['std_task_completion_rate']:.1%}")
+    print(f"Average Collisions: {eval_results['avg_collision_count']:.2f} ± {eval_results['std_collision_count']:.2f}")
+    print(f"Average Path Length: {eval_results['avg_avg_path_length']:.2f} ± {eval_results['std_avg_path_length']:.2f}")
+    print(f"Average Total Reward: {eval_results['avg_total_reward']:.2f} ± {eval_results['std_total_reward']:.2f}")
+    print(f"Path Efficiency: {eval_results['avg_avg_path_efficiency']:.3f} ± {eval_results['std_avg_path_efficiency']:.3f}")
     
-    print(f"\n1. MINIMIZING TRAVEL TIME & PATH LENGTH:")
-    print(f"   ✓ Average steps per episode: {eval_metrics['mean_total_steps']:.1f}")
-    print(f"   ✓ Path efficiency: {eval_metrics['mean_avg_path_efficiency']:.3f}")
-    if eval_metrics['mean_avg_path_efficiency'] > 0.3:
-        print(f"   → GOOD: Robots learned efficient pathfinding")
+    # Objectives assessment
+    print(f"\n{'='*60}")
+    print("OBJECTIVES ACHIEVEMENT ASSESSMENT")
+    print("="*60)
+    
+    # Objective 1: Minimizing Travel Time & Path Length
+    path_efficiency = eval_results['avg_avg_path_efficiency']
+    completion_rate = eval_results['avg_task_completion_rate']
+    obj1_score = (path_efficiency + completion_rate) / 2
+    
+    print(f"1. Minimizing Travel Time & Path Length:")
+    print(f"   ✓ Task Completion Rate: {completion_rate:.1%}")
+    print(f"   ✓ Path Efficiency: {path_efficiency:.3f}")
+    print(f"   Overall Score: {obj1_score:.3f} {'✅' if obj1_score > 0.6 else '⚠️'}")
+    
+    # Objective 2: Collision-Free Navigation
+    collision_rate = eval_results['avg_collision_count'] / eval_results['avg_total_steps']
+    collision_free_episodes = eval_results['success_rate']  # Success implies low collisions
+    
+    print(f"\n2. Collision-Free Navigation in Dynamic Environments:")
+    print(f"   ✓ Average Collisions per Episode: {eval_results['avg_collision_count']:.2f}")
+    print(f"   ✓ Collision Rate per Step: {collision_rate:.4f}")
+    print(f"   ✓ Success Rate (low collisions): {collision_free_episodes:.1%}")
+    print(f"   Achievement: {'✅' if eval_results['avg_collision_count'] < 3.0 else '⚠️'}")
+    
+    # Objective 3: Task Allocation & Multi-Robot Coordination
+    throughput = eval_results.get('avg_throughput', 0)
+    coordination_score = eval_results['success_rate'] * completion_rate
+    
+    print(f"\n3. Task Allocation & Multi-Robot Coordination:")
+    print(f"   ✓ Success Rate: {eval_results['success_rate']:.1%}")
+    print(f"   ✓ System Throughput: {throughput:.4f} tasks/step")
+    print(f"   ✓ Coordination Score: {coordination_score:.3f}")
+    print(f"   Achievement: {'✅' if coordination_score > 0.5 else '⚠️'}")
+    
+    # Overall assessment
+    overall_score = (obj1_score + (1 - min(collision_rate * 100, 1)) + coordination_score) / 3
+    print(f"\n{'='*60}")
+    print(f"OVERALL PERFORMANCE SCORE: {overall_score:.3f}")
+    print(f"Rating: {get_performance_rating(overall_score)}")
+    print("="*60)
+    
+    # Save models
+    coordinator.save_models("trained_models")
+    
+    # Run demonstration
+    print("\nRunning Trained Agent Demonstration...")
+    coordinator.run_demo(episodes=2, render=True, save_animation=True)
+    
+    return coordinator, eval_results
+
+
+def get_performance_rating(score: float) -> str:
+    """Get performance rating based on score"""
+    if score >= 0.8:
+        return "Excellent ⭐⭐⭐⭐⭐"
+    elif score >= 0.7:
+        return "Good ⭐⭐⭐⭐"
+    elif score >= 0.6:
+        return "Satisfactory ⭐⭐⭐"
+    elif score >= 0.5:
+        return "Needs Improvement ⭐⭐"
     else:
-        print(f"   → NEEDS IMPROVEMENT: Path efficiency could be better")
-    
-    print(f"\n2. COLLISION-FREE NAVIGATION:")
-    print(f"   ✓ Average collisions per episode: {eval_metrics['mean_collision_count']:.1f}")
-    print(f"   ✓ Collision rate: {eval_metrics['mean_collision_rate']:.3f}")
-    if eval_metrics['mean_collision_count'] < 3:
-        print(f"   → EXCELLENT: Low collision rate achieved")
-    elif eval_metrics['mean_collision_count'] < 6:
-        print(f"   → GOOD: Moderate collision avoidance")
-    else:
-        print(f"   → NEEDS IMPROVEMENT: High collision rate")
-    
-    print(f"\n3. TASK ALLOCATION & COORDINATION:")
-    print(f"   ✓ Average task completion rate: {eval_metrics['mean_task_completion_rate']:.1%}")
-    print(f"   ✓ Success rate: {eval_metrics['success_rate']:.1%}")
-    if eval_metrics['mean_task_completion_rate'] > 0.8:
-        print(f"   → EXCELLENT: High task completion achieved")
-    elif eval_metrics['mean_task_completion_rate'] > 0.6:
-        print(f"   → GOOD: Reasonable task completion")
-    else:
-        print(f"   → NEEDS IMPROVEMENT: Low task completion rate")
-    
-    print(f"\nOVERALL ASSESSMENT:")
-    if eval_metrics['success_rate'] > 0.7:
-        print(f"   🎯 STRONG PERFORMANCE: Q-Learning successfully learned multi-robot coordination")
-    elif eval_metrics['success_rate'] > 0.4:
-        print(f"   📈 MODERATE PERFORMANCE: Q-Learning showed learning but needs refinement")
-    else:
-        print(f"   ⚠️  WEAK PERFORMANCE: Q-Learning struggled with the multi-robot task")
-    
-    print(f"\nKEY INSIGHTS:")
-    print(f"   • Training converged after ~{len(qlearning.training_stats['episode_rewards'])} episodes")
-    print(f"   • Q-table size grew to {sum(len(q) for q in qlearning.q_tables.values())} states")
-    print(f"   • Final exploration rate: {qlearning.epsilon:.3f}")
-    
-    improvements = []
-    if eval_metrics['mean_collision_count'] > 5:
-        improvements.append("Collision avoidance (consider larger penalties)")
-    if eval_metrics['mean_task_completion_rate'] < 0.7:
-        improvements.append("Task allocation strategy (better reward shaping)")
-    if eval_metrics['mean_avg_path_efficiency'] < 0.3:
-        improvements.append("Path planning efficiency (distance-based rewards)")
-    
-    if improvements:
-        print(f"\nSUGGESTED IMPROVEMENTS:")
-        for i, improvement in enumerate(improvements, 1):
-            print(f"   {i}. {improvement}")
-    
+        return "Poor ⭐"
+
+
+def compare_with_baseline():
+    """
+    Compare Q-learning performance with random baseline
+    """
     print("\n" + "="*60)
-    print("Evaluation complete! Check the generated plots and saved model.")
+    print("BASELINE COMPARISON")
+    print("="*60)
+    
+    # Create fresh environment for baseline
+    env_baseline = MultiRobotEnvironment(
+        grid_size=(10, 10),
+        num_robots=3,
+        num_tasks=4,
+        seed=42
+    )
+    
+    # Run baseline (random policy)
+    baseline_metrics, _ = env_baseline.benchmark_random_policy(episodes=10)
+    
+    print("Random Policy Baseline:")
+    print(f"  Success Rate: {baseline_metrics['success_rate']:.1%}")
+    print(f"  Avg Completion: {baseline_metrics['avg_task_completion_rate']:.1%}")
+    print(f"  Avg Collisions: {baseline_metrics['avg_collision_count']:.2f}")
+    
+    return baseline_metrics
 
 
 if __name__ == "__main__":
-    main()
+    # Set random seeds for reproducibility
+    random.seed(42)
+    np.random.seed(42)
+    
+    try:
+        # Run main training and evaluation
+        coordinator, eval_results = main()
+        
+        # Compare with baseline
+        baseline_results = compare_with_baseline()
+        
+        print(f"\n{'='*60}")
+        print("FINAL COMPARISON: Q-Learning vs Random Policy")
+        print("="*60)
+        
+        print("Metric                    | Q-Learning | Random   | Improvement")
+        print("-" * 60)
+        print(f"Success Rate             | {eval_results['success_rate']:8.1%} | {baseline_results['success_rate']:6.1%} | {eval_results['success_rate']/max(baseline_results['success_rate'], 0.01):6.1f}x")
+        print(f"Task Completion          | {eval_results['avg_task_completion_rate']:8.1%} | {baseline_results['avg_task_completion_rate']:6.1%} | {eval_results['avg_task_completion_rate']/max(baseline_results['avg_task_completion_rate'], 0.01):6.1f}x")
+        print(f"Collisions (lower=better)| {eval_results['avg_collision_count']:8.2f} | {baseline_results['avg_collision_count']:6.2f} | {baseline_results['avg_collision_count']/max(eval_results['avg_collision_count'], 0.01):6.1f}x better")
+        
+        print("\n🎉 Q-Learning implementation completed successfully!")
+        print("📁 Models saved in 'trained_models/' directory")
+        print("📊 Training progress plot saved as 'training_progress.png'")
+        print("🎬 Demo animation saved as 'qlearning_demo.gif'")
+        
+    except ImportError as e:
+        print(f"❌ Import Error: {e}")
+        print("Please ensure 'multi_robot_env.py' is in the same directory")
+        print("or adjust the import path accordingly.")
+    except Exception as e:
+        print(f"❌ An error occurred: {e}")
+        import traceback
+        traceback.print_exc()
